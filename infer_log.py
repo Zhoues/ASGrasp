@@ -1,9 +1,13 @@
 import os
 import sys
+import time
 import numpy as np
 import torch
 import cv2
 import open3d as o3d
+import pyrender
+from tqdm import tqdm
+import trimesh
 import matplotlib.pyplot as plt
 from graspnetAPI.graspnet_eval import GraspGroup
 sys.path.append("./gsnet/pointnet2")
@@ -16,14 +20,19 @@ from collision_detector import ModelFreeCollisionDetector
 from data_utils import CameraInfo, create_point_cloud_from_depth_image, get_workspace_mask
 from D415_camera import CameraMgr
 
-SHOW_3D = True
+SHOW_3D = False
 SHOW_2D = True
+
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 def load_image(imfile, ratio=0.5):
     img = cv2.imread(imfile, 1)     # (1,3,360,640)
     img = img[:, :, ::-1].copy()    # reverse bgr to rgb
     img = torch.from_numpy(img).permute(2, 0, 1).float()
-    return img[None].cuda()
+    return img[None].to(device)
 
 def load_projmatrix_render_d415():
     cameraMgr = CameraMgr()
@@ -49,7 +58,7 @@ def load_projmatrix_render_d415():
     proj[:, :3, :4] = torch.matmul(intrinsics, poses[:, :3, :4])
 
            # (1,3,4,4)
-    return proj[None].cuda(), depth_min[None].cuda(), depth_max[None].cuda()
+    return proj[None].to(device), depth_min[None].to(device), depth_max[None].to(device)
 
 
 class MVSGSNetEval():
@@ -57,7 +66,7 @@ class MVSGSNetEval():
         self.args = cfgs
         # 创建 GSNet
         net = torch.nn.DataParallel(GraspNet(seed_feat_dim=cfgs.seed_feat_dim, graspness_threshold=cfgs.graspness_threshold, is_training=False))
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        
         net.to(device)
         # Load checkpoint
         checkpoint = torch.load(cfgs.checkpoint_path)
@@ -67,7 +76,7 @@ class MVSGSNetEval():
         print("-> loaded checkpoint %s (epoch: %d)" % (cfgs.checkpoint_path, start_epoch))
 
         # Init the mvs model
-        mvs_net = torch.nn.DataParallel(RAFTMVS_2Layer(cfgs)).cuda()
+        mvs_net = torch.nn.DataParallel(RAFTMVS_2Layer(cfgs)).to(device)
         mvs_net.load_state_dict(torch.load(cfgs.restore_ckpt))
         mvs_net = mvs_net.module
 
@@ -91,7 +100,7 @@ class MVSGSNetEval():
         vertices_2d = vertices_2d_hom[:2, :] / vertices_2d_hom[2, :]   # (2, N)
         return vertices_2d.T.astype(int)   # (N, 2)
 
-    def infer(self, rgb_path, ir1_path, ir2_path, mask_path=None, zrot=None):
+    def infer(self, rgb_path, ir1_path, ir2_path, img_path, img_high_path, img_mid_path, img_low_path, mask_path=None, zrot=None):
         with torch.no_grad():
             color = load_image(rgb_path)
             ir1 = load_image(ir1_path)
@@ -121,8 +130,8 @@ class MVSGSNetEval():
             color_masked = color[mask]
             idxs = np.random.choice(len(cloud_masked), self.args.num_point, replace=False)
 
-            cloud_sampled = cloud_masked[idxs]
-            color_sampled = color_masked[idxs]
+            all_cloud_sampled = cloud_sampled = cloud_masked[idxs]
+            all_color_sampled = color_sampled = color_masked[idxs]
 
             #add second layer
             depth1 = depth_2layer[1]    # (360, 640)
@@ -166,9 +175,9 @@ class MVSGSNetEval():
                 if 'list' in key:
                     for i in range(len(batch_data[key])):
                         for j in range(len(batch_data[key][i])):
-                            batch_data[key][i][j] = batch_data[key][i][j].cuda()
+                            batch_data[key][i][j] = batch_data[key][i][j].to(device)
                 else:
-                    batch_data[key] = batch_data[key].cuda()
+                    batch_data[key] = batch_data[key].to(device)
             # Forward pass
             with torch.no_grad():
                 try:
@@ -177,7 +186,7 @@ class MVSGSNetEval():
                     return None
                 grasp_preds = pred_decode(end_points)   # grasp_preds
 
-            torch.cuda.empty_cache()
+            # torch.cuda.empty_cache()
             preds = grasp_preds[0].detach().cpu().numpy()
             gg = GraspGroup(preds)
 
@@ -194,15 +203,14 @@ class MVSGSNetEval():
             gg = gg.nms()
             gg = gg.sort_by_score()
             count = gg.__len__()
-            if count < 1:
-                return None
-            if count > 5:
-                count = 5
-            # gg = gg[-1:]
-            gg = gg[:count]
+            if count == 0:
+                return 
+            print(f"Pose Total Num: {count}")
+            grippers = gg.to_open3d_geometry_list() 
+            grippers = [grippers[0], grippers[count//2], grippers[-1]]
 
             if SHOW_2D:
-                grippers = gg.to_open3d_geometry_list()  # 获取所有gripper的几何数据
+                # grippers = gg.to_open3d_geometry_list()  # 获取所有gripper的几何数据
                 image = cv2.imread(rgb_path)  # 读取原始RGB图像
 
                 # 遍历所有gripper
@@ -223,8 +231,28 @@ class MVSGSNetEval():
                         # 使用fillPoly填充三角形，可以确保三角形内部被填充，边缘不会单独显示
                         cv2.fillPoly(image, [pts], color=(255, 0, 255))
 
-                rgb_w_gripper_path = './test_data/rgb_image_w_gripper.png'
-                cv2.imwrite(rgb_w_gripper_path, image)  # 保存修改后的图像
+                cv2.imwrite(img_path, image)  # 保存修改后的图像
+
+                # 遍历所有gripper
+                for gripper_mesh, path in zip(grippers, [img_high_path, img_mid_path, img_low_path]):
+                    image = cv2.imread(rgb_path)  # 读取原始RGB图像
+                    gripper_points = np.asarray(gripper_mesh.vertices)   # (N, 3)
+                    triangles = np.asarray(gripper_mesh.triangles)      # 获取三角形的顶点索引
+
+                    gripper_points_2d = self.project_transform(gripper_points)  # 投影到2D平面
+
+                    # 绘制三角形
+                    for tri in triangles:
+                        pts = np.array([
+                            gripper_points_2d[tri[0]],
+                            gripper_points_2d[tri[1]],
+                            gripper_points_2d[tri[2]]
+                        ], dtype=np.int32)
+
+                        # 使用fillPoly填充三角形，可以确保三角形内部被填充，边缘不会单独显示
+                        cv2.fillPoly(image, [pts], color=(255, 0, 255))
+
+                    cv2.imwrite(path, image)  # 保存修改后的图像
 
             # Add the point cloud to the visualizer
             if SHOW_3D:
@@ -233,7 +261,6 @@ class MVSGSNetEval():
                 point_cloud.points = o3d.utility.Vector3dVector(ret_dict['point_clouds'].astype(np.float32))
                 point_cloud.colors = o3d.utility.Vector3dVector(all_color_sampled.astype(np.float32)/255.0)
                 o3d.visualization.draw_geometries([point_cloud, *grippers])
-
 
             gg = gg[:1]
             print("grasp width : ", gg.widths)
@@ -273,7 +300,7 @@ if __name__ == '__main__':
     #########################################################################
     parser.add_argument('--checkpoint_path', default='./checkpoints/minkuresunet_epoch10.tar')
     parser.add_argument('--seed_feat_dim', default=512, type=int, help='Point wise feature dim')
-    parser.add_argument('--num_point', type=int, default=55000, help='Point Number [default: 15000]')
+    parser.add_argument('--num_point', type=int, default=25000, help='Point Number [default: 15000]')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch Size during inference [default: 1]')
     parser.add_argument('--voxel_size', type=float, default=0.005, help='Voxel Size for sparse convolution')
     parser.add_argument('--collision_thresh', type=float, default=0.01,
@@ -288,10 +315,68 @@ if __name__ == '__main__':
     # rgb_path = f'./test_data/00100_0000_color.png'
     # ir1_path = f'./test_data/00100_0000_ir_l.png'
     # ir2_path = f'./test_data/00100_0000_ir_r.png' 
-    rgb_path = f'./test_data/2_rgb_image.png'
-    ir1_path = f'./test_data/2_ir1_image.png'
-    ir2_path = f'./test_data/2_ir2_image.png'
+    # rgb_path = f'./test_data/2_rgb_image.png'
+    # ir1_path = f'./test_data/2_ir1_image.png'
+    # ir2_path = f'./test_data/2_ir2_image.png'
 
-    rgb_w_gripper_path = f'./test_data/2_rgb_image_w_gripper.png'
-    gg = eval.infer(rgb_path, ir1_path, ir2_path)
+    base_path = "logs"
+
+    # 将目录和文件收集到列表中以便于后续处理
+    subdir_list = []
+    for subdir, dirs, files in os.walk(base_path):
+        subdir_list.append((subdir, files))
+
+    # 初始化进度条
+    pbar = tqdm(subdir_list, desc="Processing directories")
+    
+    # 遍历base_path下的所有子文件夹
+    for subdir, files in pbar:
+        # 创建一个字典来存储对应的文件路径
+        file_dict = {}
+        
+        # 遍历文件名，将相关文件组织在一起
+        for file in files:
+            if file.endswith('.png') or file.endswith('.ply'):
+                # 提取文件的基本id
+                parts = file.split('_')
+                file_id = parts[0]
+                file_type = '_'.join(parts[1:])
+                
+                # 将文件路径添加到字典中
+                if file_id not in file_dict:
+                    file_dict[file_id] = {}
+                file_dict[file_id][file_type] = os.path.join(subdir, file)
+        
+        # 对于每个id，检查是否存在完整的三元组，并调用函数
+        for file_id in file_dict:
+            files = file_dict[file_id]
+            print(f"In {subdir}...")
+            if 'rgb_image.png' in files and 'ir1_image.png' in files and 'ir2_image.png' in files:
+                
+                img_path = os.path.join(subdir, f"{file_id}_image_w_gripper.png")
+                img_high_path = os.path.join(subdir, f"{file_id}_image_w_high_gripper.png")
+                img_mid_path = os.path.join(subdir, f"{file_id}_image_w_mid_gripper.png")
+                img_low_path = os.path.join(subdir, f"{file_id}_image_w_low_gripper.png")
+
+                # 检查输出文件是否已存在，如果存在则跳过
+                if os.path.exists(img_high_path) and os.path.exists(img_mid_path) and os.path.exists(img_low_path):
+                    print(f"Skipped ID {file_id} as output files already exist")
+                    pbar.set_postfix_str(f"Skipped ID {file_id} as output files already exist")
+                    continue
+
+                # time.sleep(1)
+                torch.cuda.empty_cache()
+                # 构造所需的路径
+                rgb_path = files['rgb_image.png']
+                ir1_path = files['ir1_image.png']
+                ir2_path = files['ir2_image.png']
+                
+                
+                # 调用 eval.infer 函数
+                eval.infer(rgb_path, ir1_path, ir2_path, img_path, img_high_path, img_mid_path, img_low_path)
+                pbar.set_postfix_str(f"Called infer for ID {file_id}")
+                print(f"Infer called for ID {file_id} in {subdir}")
+
+    # # rgb_w_gripper_path = f'./test_data/2_rgb_image_w_gripper.png'
+    # gg = eval.infer(rgb_path, ir1_path, ir2_path, img_path)
 

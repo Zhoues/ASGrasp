@@ -16,7 +16,7 @@ from collision_detector import ModelFreeCollisionDetector
 from data_utils import CameraInfo, create_point_cloud_from_depth_image, get_workspace_mask
 from D415_camera import CameraMgr
 
-SHOW_3D = True
+SHOW_3D = False
 SHOW_2D = True
 
 def load_image(imfile, ratio=0.5):
@@ -202,17 +202,50 @@ class MVSGSNetEval():
             gg = gg[:count]
 
             if SHOW_2D:
-                grippers = gg.to_open3d_geometry_list()  # 获取所有gripper的几何数据
-                image = cv2.imread(rgb_path)  # 读取原始RGB图像
+                # image = cv2.imread(rgb_path)
 
-                # 遍历所有gripper
+                # grippers = gg.to_open3d_geometry_list()
+                
+                # for gripper_mesh in grippers:
+                #     gripper_points = np.asarray(gripper_mesh.vertices)
+                #     triangles = np.asarray(gripper_mesh.triangles)
+                #     gripper_points_2d = self.project_transform(gripper_points)
+
+                #     # 生成随机颜色
+                #     # color = tuple(np.random.randint(0, 255, size=3).tolist())
+                #     color = (219,112,147)
+                #     # import ipdb; ipdb.set_trace()
+                #     for tri in triangles:
+                #         pts = np.array([
+                #             gripper_points_2d[tri[0]],
+                #             gripper_points_2d[tri[1]],
+                #             gripper_points_2d[tri[2]]
+                #         ], dtype=np.int32)
+
+                #         cv2.fillPoly(image, [pts], color=color)
+
+                #         boundary_color = (int(color[0]*0.8), int(color[1]*0.8), int(color[2]*0.8))
+                #         cv2.polylines(image, [pts], isClosed=True, color=boundary_color, thickness=1)
+
+                #     point = gripper_points_2d[-1]
+                #     # 确保point是整数类型的元组，例如 (x, y)
+                #     center = (int(point[0]), int(point[1]))
+                #     color = (255, 0, 255)  # 紫色
+                #     radius = 3  # 点的半径
+                #     thickness = -1  # 填充点
+                #     # 在图像上绘制点
+                #     cv2.circle(image, center, radius, color, thickness)
+
+                image = cv2.imread(rgb_path)
+                grippers = gg.to_open3d_geometry_list()
+                gripper_index = 0  # 用于递增数字标注
+
                 for gripper_mesh in grippers:
-                    gripper_points = np.asarray(gripper_mesh.vertices)   # (N, 3)
-                    triangles = np.asarray(gripper_mesh.triangles)      # 获取三角形的顶点索引
+                    gripper_points = np.asarray(gripper_mesh.vertices)
+                    triangles = np.asarray(gripper_mesh.triangles)
+                    gripper_points_2d = self.project_transform(gripper_points)
 
-                    gripper_points_2d = self.project_transform(gripper_points)  # 投影到2D平面
-
-                    # 绘制三角形
+                    color = (0,255,127)
                     for tri in triangles:
                         pts = np.array([
                             gripper_points_2d[tri[0]],
@@ -220,9 +253,24 @@ class MVSGSNetEval():
                             gripper_points_2d[tri[2]]
                         ], dtype=np.int32)
 
-                        # 使用fillPoly填充三角形，可以确保三角形内部被填充，边缘不会单独显示
-                        cv2.fillPoly(image, [pts], color=(255, 0, 255))
+                        cv2.fillPoly(image, [pts], color=color)
+                        boundary_color = (int(color[0]*0.8), int(color[1]*0.8), int(color[2]*0.8))
+                        cv2.polylines(image, [pts], isClosed=True, color=boundary_color, thickness=1)
 
+                    point = gripper_points_2d[-1]
+                    center = (int(point[0]), int(point[1]))
+                    color = (255, 0, 255)
+                    radius = 3
+                    cv2.circle(image, center, radius, color, -1)
+
+                    # 绘制带数字的标注
+                    square_side = 10  # 正方形边长
+                    top_left = (center[0] - square_side//2, center[1] - square_side//2)
+                    bottom_right = (center[0] + square_side//2, center[1] + square_side//2)
+                    cv2.rectangle(image, top_left, bottom_right, (0, 0, 0), -1)  # 绘制黑色正方形
+                    cv2.putText(image, str(gripper_index), (top_left[0] + 2, bottom_right[1] - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 255), 1)
+                    gripper_index += 1  # 更新数字标注
+                
                 rgb_w_gripper_path = './test_data/rgb_image_w_gripper.png'
                 cv2.imwrite(rgb_w_gripper_path, image)  # 保存修改后的图像
 

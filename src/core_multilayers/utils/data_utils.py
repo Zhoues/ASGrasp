@@ -34,10 +34,21 @@ def create_point_cloud_from_depth_image(depth, camera, organized=True):
                 generated cloud, (H,W,3) for organized=True, (H*W,3) for organized=False
     """
     assert (depth.shape[0] == camera.height and depth.shape[1] == camera.width)
+
+    # 代表图像中每个像素的横向和纵向坐标
     xmap = np.arange(camera.width)
     ymap = np.arange(camera.height)
+
+    # np.meshgrid 函数用于生成网格点坐标矩阵。
+    # xmap 和 ymap 被转换成两个二维数组，其中每个元素分别代表对应像素位置的 x 和 y 坐标
     xmap, ymap = np.meshgrid(xmap, ymap)
+
+    # 计算每个像素点的实际深度值。
+    # 这里假设 depth 数组中的值是通过某种比例因子 camera.scale 缩放的，这行代码将其转换回真实的深度值
     points_z = depth / camera.scale
+    
+    # 通过已有的像素坐标(xmap, ymap)，计算每个点的 x 和 y 世界坐标
+    # 像素坐标减去光心点，乘以深度值 并除以焦距
     points_x = (xmap - camera.cx) * points_z / camera.fx
     points_y = (ymap - camera.cy) * points_z / camera.fy
     cloud = np.stack([points_x, points_y, points_z], axis=-1)
@@ -156,12 +167,19 @@ def get_workspace_mask(cloud, seg, trans=None, organized=True, outlier=0):
         seg = seg.reshape(h * w)
     if trans is not None:
         cloud = transform_point_cloud(cloud, trans)
+    
+    # 从点云中选取那些分割标签大于 0 的点 (默认是全选)
     foreground = cloud[seg > 0]
+
+    # 计算前景点云在 x、y、z 方向上的最小和最大值，这些值定义了一个轴对齐的包围盒
     xmin, ymin, zmin = foreground.min(axis=0)
     xmax, ymax, zmax = foreground.max(axis=0)
+
+    # 分别为 x、y、z 坐标创建掩码，检查点云每个点的坐标是否在前景点云构造的包围盒扩展了 outlier 值的范围内
     mask_x = ((cloud[:, 0] > xmin - outlier) & (cloud[:, 0] < xmax + outlier))
     mask_y = ((cloud[:, 1] > ymin - outlier) & (cloud[:, 1] < ymax + outlier))
     mask_z = ((cloud[:, 2] > zmin - outlier) & (cloud[:, 2] < zmax + outlier))
+    # 将三个方向上的掩码进行逻辑与操作，得到一个总的掩码，表示每个点是否在给定的mask扩展的工作区域内。
     workspace_mask = (mask_x & mask_y & mask_z)
     if organized:
         workspace_mask = workspace_mask.reshape([h, w])

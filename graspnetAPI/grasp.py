@@ -563,7 +563,8 @@ class GraspGroup():
         rect_grasp_group.rect_grasp_group_array = rect_grasp_group_array
         return rect_grasp_group
 
-    def nms(self, translation_thresh = 0.03, rotation_thresh = 30.0 / 180.0 * np.pi):
+    # def nms(self, translation_thresh = 0.03, rotation_thresh = 30.0 / 180.0 * np.pi):
+    def nms(self, translation_thresh = 0.06, rotation_thresh = 15.0 / 180.0 * np.pi):
         '''
         **Input:**
 
